@@ -1,10 +1,13 @@
 // ===== TEST GABUNGAN: IMU MPU6050 (RPY) + HC-SR04 (jarak) =====
-// Output tiap 50 ms (20 Hz), satu baris:
+// Data dikirim sebagai FRAME BINER (bukan teks) tiap 50 ms (20 Hz).
+// Format frame + CRC: include/telemetry_frame.h. Parser PC: pc/robot_rx.c.
+// Pesan teks berawalan '#' hanya saat boot (parser PC mengabaikannya).
+// Isi payload:
 //   RPY  : roll, pitch, yaw (derajat)
 //   G    : kecepatan putar gyro X, Y, Z (deg/s)       -> Gz = kecepatan belok
 //   LA   : akselerasi linear X, Y, Z frame sensor (m/s^2, gravitasi dibuang)
 //   WA   : akselerasi linear X, Y, Z frame dunia  (m/s^2, tidak terpengaruh miring)
-//   Jarak: cm
+//   Jarak: cm (-1 = belum ada data valid)
 // Jarak invalid (timeout / di luar rentang) -> pakai nilai valid sebelumnya,
 // "--" hanya sebelum ada data valid pertama.
 // Ketik 'z' di Serial Monitor = reset yaw ke 0.
@@ -20,6 +23,7 @@
 #include <Wire.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
+#include "telemetry_frame.h"
 
 // ---------- pin ----------
 #define PIN_SDA 21
@@ -28,7 +32,7 @@
 #define PIN_ECHO 18
 
 // ---------- konstanta ----------
-#define PRINT_PERIOD_MS 50     // cetak ke serial (20 Hz)
+#define SEND_PERIOD_MS 50      // kirim frame ke PC (20 Hz)
 #define SONAR_PERIOD_MS 50     // jeda antar trigger HC-SR04
 #define ECHO_TIMEOUT_US 30000  // tanpa echo selama ini = invalid
 #define DIST_MIN_CM 2.0f       // di luar rentang = invalid (nilai sebelumnya dipakai)
@@ -163,16 +167,33 @@ void sonarUpdate() {
   }
 }
 
+// ================= kirim frame =================
+uint8_t txSeq = 0;
+
+void sendFrame(uint8_t type, const void *payload, uint8_t len) {
+  uint8_t buf[FRAME_OVERHEAD + FRAME_MAX_PAYLOAD];
+  buf[0] = FRAME_HDR0;
+  buf[1] = FRAME_HDR1;
+  buf[2] = type;
+  buf[3] = len;
+  buf[4] = txSeq++;
+  memcpy(&buf[5], payload, len);
+  uint16_t crc = crc16_ccitt(0xFFFF, &buf[2], 3 + len);  // TYPE..akhir PAYLOAD
+  buf[5 + len] = crc & 0xFF;
+  buf[6 + len] = crc >> 8;
+  Serial.write(buf, FRAME_OVERHEAD + len);  // satu kali write, tidak terpotong
+}
+
 // ================= main =================
-uint32_t lastPrintMs = 0;
+uint32_t lastSendMs = 0;
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("# TEST GABUNGAN IMU + HC-SR04");
+  Serial.println("# TEST GABUNGAN IMU + HC-SR04 (frame biner)");
   sonarInit();
   imuInit();
-  Serial.println("# Format: RPY(deg) | G xyz(deg/s) | LA xyz(m/s2) | WA xyz(m/s2) | Jarak(cm). 'z' = reset yaw.");
+  Serial.println("# Mulai kirim frame. Kirim 'z' = reset yaw.");
 }
 
 void loop() {
@@ -180,23 +201,22 @@ void loop() {
   sonarUpdate();
 
   if (Serial.available() && Serial.read() == 'z') {
-    yawOffset = ypr[0] * RAD_TO_DEG;
-    Serial.println("# yaw direset");
+    yawOffset = ypr[0] * RAD_TO_DEG;  // tanpa balasan teks agar stream biner bersih
   }
 
-  if (millis() - lastPrintMs >= PRINT_PERIOD_MS) {
-    lastPrintMs = millis();
-    float roll  = ypr[2] * RAD_TO_DEG;
-    float pitch = ypr[1] * RAD_TO_DEG;
-    float yaw   = wrap180(ypr[0] * RAD_TO_DEG - yawOffset);
+  if (millis() - lastSendMs >= SEND_PERIOD_MS) {
+    lastSendMs = millis();
     const float kG = 1.0f / GYRO_LSB_PER_DPS;
     const float kA = G_MS2 / ACC_LSB_PER_G;
-    Serial.printf("RPY %7.2f %7.2f %7.2f | G %7.1f %7.1f %7.1f | LA %6.2f %6.2f %6.2f | WA %6.2f %6.2f %6.2f | Jarak ",
-                  roll, pitch, yaw,
-                  gyroRaw.x * kG, gyroRaw.y * kG, gyroRaw.z * kG,
-                  accLin.x * kA, accLin.y * kA, accLin.z * kA,
-                  accWorld.x * kA, accWorld.y * kA, accWorld.z * kA);
-    if (distance < 0) Serial.println("--");
-    else Serial.printf("%.2f\n", distance);
+    TelemetryPayload p;
+    p.t_ms  = lastSendMs;
+    p.roll  = ypr[2] * RAD_TO_DEG;
+    p.pitch = ypr[1] * RAD_TO_DEG;
+    p.yaw   = wrap180(ypr[0] * RAD_TO_DEG - yawOffset);
+    p.gx  = gyroRaw.x * kG;   p.gy  = gyroRaw.y * kG;   p.gz  = gyroRaw.z * kG;
+    p.lax = accLin.x * kA;    p.lay = accLin.y * kA;    p.laz = accLin.z * kA;
+    p.wax = accWorld.x * kA;  p.way = accWorld.y * kA;  p.waz = accWorld.z * kA;
+    p.dist_cm = distance;
+    sendFrame(FRAME_TYPE_TELEMETRY, &p, sizeof(p));
   }
 }
