@@ -2,9 +2,8 @@
 // Build : gcc -O2 -Wall -I../include -o robot_rx robot_rx.c
 // Jalan : ./robot_rx /dev/ttyUSB0          (default /dev/ttyUSB0, 115200 baud)
 //
-// Format frame: lihat include/telemetry_frame.h
-// Parser = state machine per byte: cari header 0xAA 0x55, baca TYPE/LEN/SEQ/PAYLOAD,
-// cek CRC16. Byte di luar frame (mis. teks '#' saat boot ESP32) otomatis dibuang.
+// Monitor saja (tidak mengirim perintah). Untuk kontrol motor/servo: robot_teleop.c
+// Format frame + parser: include/protocol.h (dipakai bersama firmware).
 // Asumsi: PC little-endian (x86/ARM umumnya), sama dengan ESP32.
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,99 +15,10 @@
 #include <errno.h>
 #include <signal.h>
 
-#include "telemetry_frame.h"
-
-// ---------------- parser ----------------
-typedef enum { S_HDR0, S_HDR1, S_TYPE, S_LEN, S_SEQ, S_PAYLOAD, S_CRC_L, S_CRC_H } ParseState;
-
-typedef struct {
-  ParseState state;
-  uint8_t type, len, seq, idx;
-  uint8_t payload[FRAME_MAX_PAYLOAD];
-  uint16_t crc_rx;
-  // statistik
-  uint32_t ok, crc_err, len_err, lost;
-  int last_seq;  // -1 = belum ada
-} Parser;
-
-static void parser_init(Parser *p) {
-  memset(p, 0, sizeof(*p));
-  p->state = S_HDR0;
-  p->last_seq = -1;
-}
-
-// Masukkan satu byte. Return true jika satu frame valid lengkap (data di p->type/len/payload).
-static bool parser_feed(Parser *p, uint8_t b) {
-  switch (p->state) {
-    case S_HDR0:
-      if (b == FRAME_HDR0) p->state = S_HDR1;
-      break;
-    case S_HDR1:
-      if (b == FRAME_HDR1) p->state = S_TYPE;
-      else p->state = (b == FRAME_HDR0) ? S_HDR1 : S_HDR0;  // 0xAA 0xAA 0x55 tetap tersinkron
-      break;
-    case S_TYPE:
-      p->type = b;
-      p->state = S_LEN;
-      break;
-    case S_LEN:
-      if (b > FRAME_MAX_PAYLOAD) {  // panjang mustahil -> sinkron ulang
-        p->len_err++;
-        p->state = S_HDR0;
-      } else {
-        p->len = b;
-        p->state = S_SEQ;
-      }
-      break;
-    case S_SEQ:
-      p->seq = b;
-      p->idx = 0;
-      p->state = p->len ? S_PAYLOAD : S_CRC_L;
-      break;
-    case S_PAYLOAD:
-      p->payload[p->idx++] = b;
-      if (p->idx >= p->len) p->state = S_CRC_L;
-      break;
-    case S_CRC_L:
-      p->crc_rx = b;
-      p->state = S_CRC_H;
-      break;
-    case S_CRC_H: {
-      p->crc_rx |= (uint16_t)b << 8;
-      p->state = S_HDR0;
-      uint8_t head[3] = {p->type, p->len, p->seq};
-      uint16_t crc = crc16_ccitt(0xFFFF, head, 3);
-      crc = crc16_ccitt(crc, p->payload, p->len);
-      if (crc != p->crc_rx) {
-        p->crc_err++;
-        return false;
-      }
-      if (p->last_seq >= 0) p->lost += (uint8_t)(p->seq - p->last_seq - 1);
-      p->last_seq = p->seq;
-      p->ok++;
-      return true;
-    }
-  }
-  return false;
-}
+#include "protocol.h"
+#include "serial_port.h"
 
 // ---------------- serial ----------------
-static int serial_open(const char *dev) {
-  int fd = open(dev, O_RDWR | O_NOCTTY);
-  if (fd < 0) return -1;
-  struct termios t;
-  if (tcgetattr(fd, &t) < 0) { close(fd); return -1; }
-  cfmakeraw(&t);                 // mode biner murni: tanpa echo, tanpa konversi \r\n
-  cfsetispeed(&t, B115200);
-  cfsetospeed(&t, B115200);
-  t.c_cflag |= CLOCAL | CREAD;
-  t.c_cflag &= ~CRTSCTS;
-  t.c_cc[VMIN] = 1;              // read() blok sampai ada minimal 1 byte
-  t.c_cc[VTIME] = 0;
-  if (tcsetattr(fd, TCSANOW, &t) < 0) { close(fd); return -1; }
-  tcflush(fd, TCIOFLUSH);
-  return fd;
-}
 
 static volatile sig_atomic_t running = 1;
 static void on_sigint(int s) { (void)s; running = 0; }
@@ -116,7 +26,7 @@ static void on_sigint(int s) { (void)s; running = 0; }
 // ---------------- main ----------------
 int main(int argc, char **argv) {
   const char *dev = argc > 1 ? argv[1] : "/dev/ttyUSB0";
-  int fd = serial_open(dev);
+  int fd = serial_open(dev, 1);
   if (fd < 0) {
     fprintf(stderr, "Gagal buka %s: %s\n", dev, strerror(errno));
     fprintf(stderr, "Cek port (ls /dev/ttyUSB*) dan izin (sudo usermod -aG dialout $USER).\n");
@@ -129,7 +39,7 @@ int main(int argc, char **argv) {
   sigaction(SIGINT, &sa, NULL);
   printf("Membaca %s ... Ctrl+C untuk keluar.\n", dev);
 
-  Parser p;
+  FrameParser p;
   parser_init(&p);
   uint8_t buf[256];
 
@@ -152,6 +62,8 @@ int main(int argc, char **argv) {
                t.lax, t.lay, t.laz, t.wax, t.way, t.waz);
         if (t.dist_cm < 0) printf("--");
         else printf("%.2f", t.dist_cm);
+        printf(" | M %4d %4d S %3u%s", t.motor_l, t.motor_r, t.servo_deg,
+               (t.flags & TLM_FLAG_FAILSAFE) ? " FAILSAFE" : "");
         printf(" | ok %u crc_err %u hilang %u\n", p.ok, p.crc_err, p.lost);
       } else {
         printf("# frame tipe 0x%02X len %u tidak dikenal\n", p.type, p.len);
